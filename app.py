@@ -1,51 +1,59 @@
-from flask import Flask, request, jsonify, send_file
-from transformers import pipeline
+from flask import Flask, request, send_file
 from PIL import Image
 import io
 import requests
+import torch
+from torchvision import transforms
+from transformers import AutoModelForImageSegmentation
 
 app = Flask(__name__)
+hf_token = ""
+# Initialize model with remote code trust
+model = AutoModelForImageSegmentation.from_pretrained(
+    'briaai/RMBG-2.0',
+    trust_remote_code=True,token=hf_token
+)
+model.to('cuda' if torch.cuda.is_available() else 'cpu')
+model.eval()
 
-# Load the background removal model
-pipe = pipeline("image-segmentation", model="briaai/RMBG-2.0", trust_remote_code=True)
+# Preprocessing transformations
+image_size = (1024, 1024)
+transform = transforms.Compose([
+    transforms.Resize(image_size),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
 
-@app.route('/')
-def home():
-    return jsonify({"message": "Background Removal API is running!"})
-
-@app.route('/process-url', methods=['POST'])
-def process_url():
+@app.route('/process', methods=['POST'])
+def process_image():
     try:
-        data = request.get_json()
-        image_url = data.get("image_url")
-
-        if not image_url:
-            return jsonify({"error": "No image URL provided"}), 400
-
-        # Fetch the image from the URL
-        response = requests.get(image_url, stream=True)
-        if response.status_code != 200:
-            return jsonify({"error": "Failed to fetch image from URL"}), 400
-
-        # Open image from the URL
-        image = Image.open(io.BytesIO(response.content)).convert("RGB")
-
-        # Process the image
-        output_image = pipe(image)
-
-        # Convert image to RGBA
-        output_image = output_image.convert("RGBA")
-
-        # Save processed image in memory
+        # Get image URL from request
+        image_url = request.json.get('image_url')
+        response = requests.get(image_url)
+        original_image = Image.open(io.BytesIO(response.content)).convert('RGB')
+        
+        # Preprocess
+        input_tensor = transform(original_image).unsqueeze(0).to(model.device)
+        
+        # Inference
+        with torch.no_grad():
+            pred = model(input_tensor)[-1].sigmoid().cpu()
+        
+        # Post-process mask
+        mask = transforms.ToPILImage()(pred.squeeze()).resize(original_image.size)
+        
+        # Apply alpha channel
+        original_image.putalpha(mask)
+        
+        # Return result
         img_io = io.BytesIO()
-        output_image.save(img_io, format="PNG")
+        original_image.save(img_io, 'PNG')
         img_io.seek(0)
-
         return send_file(img_io, mimetype='image/png')
 
     except Exception as e:
-        print("Error:", str(e))  # Debugging
-        return jsonify({"error": str(e)}), 500
+        return {'error': str(e)}, 500
 
 if __name__ == '__main__':
     app.run(debug=True)
+ 
